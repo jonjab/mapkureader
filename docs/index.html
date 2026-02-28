@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mapkureader — IIIF Map Viewer</title>
+<script src="https://cdn.jsdelivr.net/npm/openseadragon@4.1/build/openseadragon/openseadragon.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a2e; color: #e0e0e0; font-family: system-ui, sans-serif; height: 100vh; overflow: hidden; }
+  #viewer { width: 100%; height: 100vh; }
+
+  /* Info panel */
+  #info {
+    position: absolute; top: 12px; right: 12px; z-index: 10;
+    background: rgba(20, 20, 40, 0.88); border: 1px solid #333; border-radius: 8px;
+    padding: 14px 18px; min-width: 220px; max-width: 320px;
+    font-size: 13px; line-height: 1.5;
+    backdrop-filter: blur(8px);
+  }
+  #info h2 { font-size: 14px; margin-bottom: 8px; color: #00e5ff; font-weight: 600; }
+  #info .meta { color: #aaa; margin-bottom: 6px; }
+  #info .meta span { color: #e0e0e0; }
+
+  /* Controls */
+  .controls { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+  .controls select, .controls button {
+    background: #2a2a4a; color: #e0e0e0; border: 1px solid #444; border-radius: 4px;
+    padding: 4px 10px; font-size: 12px; cursor: pointer;
+  }
+  .controls select:hover, .controls button:hover { border-color: #00e5ff; }
+  .controls button:active { background: #3a3a5a; }
+  .kbd { display: inline-block; background: #333; border: 1px solid #555; border-radius: 3px; padding: 0 5px; font-size: 11px; font-family: monospace; }
+
+  /* Patch overlay cells */
+  .patch-cell {
+    border: 1px solid #00e5ff;
+    box-sizing: border-box;
+    cursor: crosshair;
+    transition: background 0.1s;
+  }
+  .patch-cell:hover { background: rgba(0, 229, 255, 0.15); }
+
+  /* Tooltip */
+  #tooltip {
+    display: none; position: fixed; z-index: 20;
+    background: rgba(20, 20, 40, 0.92); border: 1px solid #00e5ff; border-radius: 4px;
+    padding: 4px 8px; font-size: 12px; color: #e0e0e0; pointer-events: none;
+    white-space: nowrap;
+  }
+
+  /* Loading overlay */
+  #loading {
+    position: absolute; inset: 0; z-index: 30;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(26, 26, 46, 0.95);
+    font-size: 16px; color: #00e5ff;
+  }
+  #loading.hidden { display: none; }
+</style>
+</head>
+<body>
+
+<div id="viewer"></div>
+
+<div id="info">
+  <h2 id="map-title">Loading...</h2>
+  <div class="meta">Dimensions: <span id="dimensions">—</span></div>
+  <div class="meta">Patches: <span id="patch-count">—</span></div>
+  <div class="meta">Grid: <span id="grid-status">on</span> &nbsp; <kbd class="kbd">g</kbd> toggle</div>
+  <div class="controls">
+    <label for="patch-size">Patch:</label>
+    <select id="patch-size">
+      <option value="64">64 px</option>
+      <option value="128">128 px</option>
+      <option value="256" selected>256 px</option>
+      <option value="512">512 px</option>
+    </select>
+    <button id="reroll">Re-roll map</button>
+  </div>
+</div>
+
+<div id="tooltip"></div>
+<div id="loading">Fetching IIIF manifest...</div>
+
+<script>
+const MANIFESTS = [
+  "https://purl.stanford.edu/fh219yb6573/iiif/manifest",
+  "https://www.davidrumsey.com/luna/servlet/iiif/m/RUMSEY~8~1~200375~3001080/manifest"
+];
+
+let viewer = null;
+let gridVisible = true;
+let overlays = [];
+let currentManifest = null;
+let imageWidth = 0;
+let imageHeight = 0;
+
+// --- IIIF manifest parsing (mirrors Python _parse_manifest_image) ---
+
+function parseManifestImage(manifest) {
+  // Try v2: sequences -> canvases -> images -> resource -> service
+  const sequences = manifest.sequences || [];
+  for (const seq of sequences) {
+    for (const canvas of (seq.canvases || [])) {
+      for (const image of (canvas.images || [])) {
+        const resource = image.resource || {};
+        let service = resource.service || {};
+        if (Array.isArray(service)) service = service[0] || {};
+        const serviceId = (service["@id"] || service.id || "").replace(/\/+$/, "");
+        if (serviceId) {
+          const w = resource.width || canvas.width || 0;
+          const h = resource.height || canvas.height || 0;
+          return { serviceUrl: serviceId, width: parseInt(w), height: parseInt(h) };
+        }
+      }
+    }
+  }
+
+  // Try v3: items -> items -> items -> body -> service
+  for (const canvas of (manifest.items || [])) {
+    for (const annoPage of (canvas.items || [])) {
+      for (const anno of (annoPage.items || [])) {
+        const body = anno.body || {};
+        let services = body.service || [];
+        if (!Array.isArray(services)) services = [services];
+        for (const svc of services) {
+          const svcId = (svc["@id"] || svc.id || "").replace(/\/+$/, "");
+          if (svcId) {
+            const w = body.width || canvas.width || 0;
+            const h = body.height || canvas.height || 0;
+            return { serviceUrl: svcId, width: parseInt(w), height: parseInt(h) };
+          }
+        }
+      }
+    }
+  }
+
+  throw new Error("Could not find an image service in the manifest");
+}
+
+function parseManifestLabel(manifest) {
+  const label = manifest.label;
+  if (!label) return "IIIF Map";
+  if (typeof label === "string") return label;
+  // v3 labels: { "en": ["..."], ... }
+  if (typeof label === "object") {
+    const vals = Object.values(label).flat();
+    if (vals.length > 0) return vals[0];
+  }
+  return "IIIF Map";
+}
+
+// --- Patch grid computation (mirrors Python MapImage.patchify) ---
+
+function computePatches(width, height, patchSize) {
+  const stride = patchSize; // no overlap
+  const patches = [];
+  let row = 0;
+  for (let y = 0; y < height; y += stride) {
+    let col = 0;
+    for (let x = 0; x < width; x += stride) {
+      const pw = Math.min(patchSize, width - x);
+      const ph = Math.min(patchSize, height - y);
+      if (pw > 0 && ph > 0) {
+        patches.push({ x, y, w: pw, h: ph, row, col });
+      }
+      col++;
+    }
+    row++;
+  }
+  return patches;
+}
+
+// --- Overlay management ---
+
+function clearOverlays() {
+  for (const el of overlays) {
+    try { viewer.removeOverlay(el); } catch (_) {}
+    el.remove();
+  }
+  overlays = [];
+}
+
+function addPatchOverlays(patches, width) {
+  clearOverlays();
+  const tooltip = document.getElementById("tooltip");
+
+  for (const p of patches) {
+    const el = document.createElement("div");
+    el.className = "patch-cell";
+    // OSD viewport coords: divide all by width (OSD normalizes x to [0,1])
+    const rect = new OpenSeadragon.Rect(
+      p.x / width,
+      p.y / width,
+      p.w / width,
+      p.h / width
+    );
+    viewer.addOverlay({ element: el, location: rect });
+    overlays.push(el);
+
+    el.addEventListener("mouseenter", (e) => {
+      tooltip.textContent = `row ${p.row}, col ${p.col}  (${p.w}x${p.h} px)`;
+      tooltip.style.display = "block";
+    });
+    el.addEventListener("mousemove", (e) => {
+      tooltip.style.left = (e.clientX + 14) + "px";
+      tooltip.style.top = (e.clientY + 14) + "px";
+    });
+    el.addEventListener("mouseleave", () => {
+      tooltip.style.display = "none";
+    });
+  }
+
+  document.getElementById("patch-count").textContent = patches.length;
+  document.getElementById("grid-status").textContent = gridVisible ? "on" : "off";
+}
+
+function setGridVisibility(visible) {
+  gridVisible = visible;
+  for (const el of overlays) {
+    el.style.display = visible ? "" : "none";
+  }
+  document.getElementById("grid-status").textContent = visible ? "on" : "off";
+}
+
+function rebuildGrid() {
+  const patchSize = parseInt(document.getElementById("patch-size").value);
+  const patches = computePatches(imageWidth, imageHeight, patchSize);
+  addPatchOverlays(patches, imageWidth);
+  if (!gridVisible) setGridVisibility(false);
+}
+
+// --- Main loader ---
+
+async function loadMap(manifestUrl) {
+  const loadingEl = document.getElementById("loading");
+  loadingEl.classList.remove("hidden");
+  loadingEl.textContent = "Fetching IIIF manifest...";
+  currentManifest = manifestUrl;
+
+  try {
+    const resp = await fetch(manifestUrl);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const manifest = await resp.json();
+
+    const { serviceUrl, width, height } = parseManifestImage(manifest);
+    const label = parseManifestLabel(manifest);
+    imageWidth = width;
+    imageHeight = height;
+
+    document.getElementById("map-title").textContent = label;
+    document.getElementById("dimensions").textContent = `${width} x ${height}`;
+
+    loadingEl.textContent = "Initializing viewer...";
+
+    // Destroy existing viewer if reloading
+    if (viewer) {
+      clearOverlays();
+      viewer.destroy();
+      viewer = null;
+    }
+
+    viewer = OpenSeadragon({
+      id: "viewer",
+      prefixUrl: "https://cdn.jsdelivr.net/npm/openseadragon@4.1/build/openseadragon/images/",
+      tileSources: {
+        "@context": "http://iiif.io/api/image/2/context.json",
+        "@id": serviceUrl,
+        "protocol": "http://iiif.io/api/image",
+        "width": width,
+        "height": height,
+        "profile": ["http://iiif.io/api/image/2/level2.json"],
+        "tiles": [{ "width": 256, "scaleFactors": [1, 2, 4, 8, 16, 32] }]
+      },
+      showNavigator: true,
+      navigatorPosition: "BOTTOM_LEFT",
+      navigatorAutoFade: true,
+      maxZoomPixelRatio: 4,
+      animationTime: 0.3,
+      gestureSettingsMouse: { clickToZoom: false },
+    });
+
+    viewer.addHandler("open", () => {
+      loadingEl.classList.add("hidden");
+      rebuildGrid();
+    });
+
+    viewer.addHandler("open-failed", (e) => {
+      loadingEl.textContent = "Failed to load image tiles. Trying info.json...";
+      // Fallback: try loading via info.json directly
+      viewer.destroy();
+      viewer = OpenSeadragon({
+        id: "viewer",
+        prefixUrl: "https://cdn.jsdelivr.net/npm/openseadragon@4.1/build/openseadragon/images/",
+        tileSources: serviceUrl + "/info.json",
+        showNavigator: true,
+        navigatorPosition: "BOTTOM_LEFT",
+        navigatorAutoFade: true,
+        maxZoomPixelRatio: 4,
+        animationTime: 0.3,
+        gestureSettingsMouse: { clickToZoom: false },
+      });
+      viewer.addHandler("open", () => {
+        loadingEl.classList.add("hidden");
+        rebuildGrid();
+      });
+      viewer.addHandler("open-failed", () => {
+        loadingEl.textContent = "Failed to load IIIF image. Try re-rolling.";
+      });
+    });
+
+  } catch (err) {
+    loadingEl.textContent = `Error: ${err.message}`;
+    console.error(err);
+  }
+}
+
+// --- Events ---
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "g" || e.key === "G") {
+    setGridVisibility(!gridVisible);
+  }
+});
+
+document.getElementById("patch-size").addEventListener("change", rebuildGrid);
+
+document.getElementById("reroll").addEventListener("click", () => {
+  // Pick a different manifest than the current one
+  const choices = MANIFESTS.filter(m => m !== currentManifest);
+  const next = choices.length > 0 ? choices[Math.floor(Math.random() * choices.length)] : MANIFESTS[0];
+  loadMap(next);
+});
+
+// --- Start ---
+loadMap(MANIFESTS[Math.floor(Math.random() * MANIFESTS.length)]);
+</script>
+</body>
+</html>
